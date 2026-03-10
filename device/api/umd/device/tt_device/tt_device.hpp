@@ -19,6 +19,7 @@
 #include "umd/device/pcie/pci_device.hpp"
 #include "umd/device/pcie/tlb_window.hpp"
 #include "umd/device/types/cluster_descriptor_types.hpp"
+#include "umd/device/types/cluster_types.hpp"
 #include "umd/device/types/communication_protocol.hpp"
 #include "umd/device/utils/lock_manager.hpp"
 #include "umd/device/utils/timeouts.hpp"
@@ -54,7 +55,10 @@ public:
      * Jtag support can be enabled.
      */
     static std::unique_ptr<TTDevice> create(
-        int device_number, IODeviceType device_type = IODeviceType::PCIe, bool use_safe_api = false);
+        int device_number,
+        IODeviceType device_type = IODeviceType::PCIe,
+        bool use_safe_api = false,
+        bool power_aware = false);
     static std::unique_ptr<TTDevice> create(
         std::unique_ptr<RemoteCommunication> remote_communication, bool use_safe_api = false);
 
@@ -236,6 +240,12 @@ public:
     virtual void configure_iatu_region(size_t region, uint64_t target, size_t region_size);
 
     virtual ChipInfo get_chip_info();
+
+    /**
+     * Set power state via KMD SET_POWER_STATE ioctl so the kernel aggregates across all fds.
+     * @return true if the state was set via ioctl (e.g. Blackhole PCIe), false to use direct ARC path.
+     */
+    virtual bool set_power_state_via_kmd(DevicePowerState state) { return false; }
 
     FirmwareBundleVersion get_firmware_version();
 

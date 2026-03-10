@@ -41,6 +41,15 @@ BlackholeTTDevice::BlackholeTTDevice(std::shared_ptr<JtagDevice> jtag_device, ui
     arc_core = blackhole::get_arc_core(BlackholeTTDevice::get_noc_translation_enabled(), is_selected_noc1());
 }
 
+bool BlackholeTTDevice::set_power_state_via_kmd(DevicePowerState state) {
+    std::shared_ptr<PCIDevice> pci = get_pci_device();
+    if (!pci) {
+        return false;  /* JTAG-created device: no chardev fd, use direct ARC path */
+    }
+    pci->set_power_state_ioctl(state);
+    return true;
+}
+
 BlackholeTTDevice::~BlackholeTTDevice() {
     // Turn off iATU for the regions we programmed.  This won't happen if the
     // application crashes -- this is a good example of why userspace should not

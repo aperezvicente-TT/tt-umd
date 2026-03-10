@@ -118,6 +118,16 @@ enum tt_noc_ordering {
 int tt_device_open(const char* chardev_path, tt_device_t** out_dev);
 
 /**
+ * @brief Open a Tenstorrent device in power-aware mode (O_APPEND).
+ * Does not set default power state or trigger aggregation on open.
+ * Use for scanning/monitoring without affecting device power.
+ *
+ * @param chardev_path e.g. "/dev/tenstorrent/0"
+ * @param out_dev Device handle
+ */
+int tt_device_open_power_aware(const char* chardev_path, tt_device_t** out_dev);
+
+/**
  * @brief Close a Tenstorrent device.
  *
  * @param dev Device handle

@@ -266,12 +266,20 @@ std::vector<int> PCIDevice::enumerate_devices() {
 
     std::vector<std::string> device_tokens = utils::split_string_by_comma(tt_visible_devices_str);
 
+    std::vector<int> all_device_ids = get_all_device_ids();
     std::map<std::string, int> bdf_to_device_id_map = get_bdf_to_device_id_map();
 
-    std::vector<int> all_device_ids = {};
-
-    for (const auto &[bdf, device_id] : get_bdf_to_device_id_map()) {
-        all_device_ids.push_back(device_id);
+    // Build a globally-stable logical ID map: sort all devices by BDF, then assign
+    // 0-based indices.  This map is always computed from the *full* device set so
+    // that logical IDs are stable regardless of what TT_VISIBLE_DEVICES contains.
+    // logical_id_to_kmd[i] == KMD device ID whose BDF-sorted rank is i.
+    std::vector<std::pair<std::string, int>> bdf_sorted_devices(bdf_to_device_id_map.begin(), bdf_to_device_id_map.end());
+    std::sort(bdf_sorted_devices.begin(), bdf_sorted_devices.end(),
+              [](const auto &a, const auto &b) { return a.first < b.first; });
+    std::vector<int> logical_id_to_kmd;
+    logical_id_to_kmd.reserve(bdf_sorted_devices.size());
+    for (const auto &p : bdf_sorted_devices) {
+        logical_id_to_kmd.push_back(p.second);
     }
 
     std::set<int> filtered_device_ids;
@@ -310,23 +318,26 @@ std::vector<int> PCIDevice::enumerate_devices() {
         bool is_integer = !device_token.empty() && std::all_of(device_token.begin(), device_token.end(), ::isdigit);
 
         if (is_integer) {
-            int logical_device_id = std::stoi(device_token);
-
-            if (logical_device_id < 0 || logical_device_id >= all_device_ids.size()) {
+            // Integers are interpreted as stable logical IDs (0-based BDF-sorted rank
+            // over the *full* device set), so that the same integer always selects the
+            // same physical device regardless of which other devices are also visible.
+            int logical_id = std::stoi(device_token);
+            if (logical_id >= 0 && logical_id < static_cast<int>(logical_id_to_kmd.size())) {
+                int kmd_id = logical_id_to_kmd[logical_id];
+                filtered_device_ids.insert(kmd_id);
+                log_debug(
+                    LogUMD,
+                    "Added device kmd_id {} (logical_id={}) because of token filter {}.",
+                    kmd_id,
+                    logical_id,
+                    device_token);
+            } else {
                 TT_THROW(
-                    "Invalid device ID in TT_VISIBLE_DEVICES: {}.  Valid device identifiers are either integers or "
-                    "part of the BDF string. Valid integer IDs are between 0 and {}.",
-                    device_token,
-                    all_device_ids.size() - 1);
+                    "Invalid logical device ID {} in TT_VISIBLE_DEVICES: value must be in [0, {}).  "
+                    "Valid identifiers are BDF-sorted logical IDs (integers) or BDF substrings.",
+                    logical_id,
+                    logical_id_to_kmd.size());
             }
-
-            log_debug(
-                LogUMD,
-                "Added device id {} because of token filter {}.",
-                all_device_ids[logical_device_id],
-                device_token);
-
-            filtered_device_ids.insert(all_device_ids[logical_device_id]);
 
         } else {
             TT_THROW(
@@ -362,10 +373,15 @@ std::map<int, PciDeviceInfo> PCIDevice::enumerate_devices_info() {
     return infos;
 }
 
-PCIDevice::PCIDevice(int pci_device_number) :
+static int open_chardev_fd(const std::string& path, bool power_aware) {
+    int flags = power_aware ? (O_RDWR | O_CLOEXEC | O_APPEND) : (O_RDWR | O_CLOEXEC);
+    return open(path.c_str(), flags);
+}
+
+PCIDevice::PCIDevice(int pci_device_number, bool power_aware) :
     device_path(fmt::format("/dev/tenstorrent/{}", pci_device_number)),
     pci_device_num(pci_device_number),
-    pci_device_file_desc(open(device_path.c_str(), O_RDWR | O_CLOEXEC)),
+    pci_device_file_desc(open_chardev_fd(device_path, power_aware)),
     info(read_device_info(pci_device_file_desc)),
     numa_node(read_sysfs<int>(info, "numa_node", -1)),  // default to -1 if not found
     revision(read_sysfs<int>(info, "revision")),
@@ -387,7 +403,8 @@ PCIDevice::PCIDevice(int pci_device_number) :
             KMD_MAP_TO_NOC.to_string());
     }
 
-    int ret_code = tt_device_open(device_path.c_str(), &tt_device_handle);
+    int ret_code = power_aware ? tt_device_open_power_aware(device_path.c_str(), &tt_device_handle)
+                               : tt_device_open(device_path.c_str(), &tt_device_handle);
 
     if (ret_code != 0) {
         if (tt_device_handle != nullptr) {
@@ -836,6 +853,17 @@ void PCIDevice::configure_tlb(const uint32_t tlb_index, const tlb_data &tlb_conf
 
 void PCIDevice::reset_device_ioctl(const std::unordered_set<int> &pci_target_devices, TenstorrentResetDevice flag) {
     umd::reset_device_ioctl(pci_target_devices, static_cast<uint32_t>(flag));
+}
+
+void PCIDevice::set_power_state_ioctl(DevicePowerState state) {
+    struct tenstorrent_power_state power_state = {};
+    power_state.argsz = sizeof(power_state);
+    power_state.validity = TT_POWER_VALIDITY(1, 0);  /* 1 flag (MAX_AI_CLK), 0 settings */
+    power_state.power_flags = (state == DevicePowerState::BUSY) ? TT_POWER_FLAG_MAX_AI_CLK : 0;
+
+    if (ioctl(pci_device_file_desc, TENSTORRENT_IOCTL_SET_POWER_STATE, &power_state) == -1) {
+        TT_THROW("TENSTORRENT_IOCTL_SET_POWER_STATE failed: {}", strerror(errno));
+    }
 }
 
 uint8_t PCIDevice::read_command_byte(const int pci_device_num) {

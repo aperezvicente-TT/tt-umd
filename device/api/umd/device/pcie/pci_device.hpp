@@ -18,6 +18,7 @@
 #include "umd/device/pcie/tlb_handle.hpp"
 #include "umd/device/tt_kmd_lib/tt_kmd_lib.h"
 #include "umd/device/types/arch.hpp"
+#include "umd/device/types/cluster_types.hpp"
 #include "umd/device/types/tlb.hpp"
 #include "umd/device/types/xy_pair.hpp"
 #include "umd/device/utils/semver.hpp"
@@ -150,8 +151,10 @@ public:
      * sysfs, and maps device memory region(s) into the process address space.
      *
      * @param pci_device_number     N in /dev/tenstorrent/N
+     * @param power_aware           If true, open with O_APPEND so the kernel does not set default
+     *                              power state or trigger aggregation on open (scan without power-up).
      */
-    PCIDevice(int pci_device_number);
+    PCIDevice(int pci_device_number, bool power_aware = false);
 
     /**
      * PCIDevice destructor.
@@ -286,6 +289,12 @@ public:
      * Reset device via ioctl.
      */
     static void reset_device_ioctl(const std::unordered_set<int> &pci_target_devices, TenstorrentResetDevice flag);
+
+    /**
+     * Set device power state via KMD SET_POWER_STATE ioctl.
+     * Used by Blackhole so the kernel aggregates power state across all open fds.
+     */
+    void set_power_state_ioctl(DevicePowerState state);
 
     /**
      * Temporary function which allows us to support both ways of mapping buffers during the transition period.

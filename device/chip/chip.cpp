@@ -235,6 +235,12 @@ int Chip::arc_msg(
 }
 
 void Chip::set_power_state(DevicePowerState state) {
+    /* Prefer KMD ioctl path when supported (Blackhole PCIe). Kernel aggregates power state across all fds. */
+    if (get_tt_device()->set_power_state_via_kmd(state)) {
+        wait_for_aiclk_value(get_tt_device(), state);
+        return;
+    }
+
     int exit_code = 0;
     if (soc_descriptor_.arch == tt::ARCH::WORMHOLE_B0) {
         uint32_t msg = get_power_state_arc_msg(state);

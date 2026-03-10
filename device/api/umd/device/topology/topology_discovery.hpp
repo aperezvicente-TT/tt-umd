@@ -30,6 +30,10 @@ struct TopologyDiscoveryOptions {
     // Skip waiting for ETH core training.
     bool no_wait_for_eth_training = false;
 
+    // Open devices with O_APPEND (power-aware). Do not set default power state or trigger
+    // aggregation on open; chips stay at current power. Use for scanning/monitoring without powering up.
+    bool power_aware = false;
+
     // Allow unsupported ETH firmware versions and do not fail when
     // cores have different ETH firmware versions.
     bool no_eth_firmware_strictness = false;
