@@ -321,10 +321,33 @@ std::vector<int> PCIDevice::enumerate_devices() {
 
             filtered_device_ids.insert(all_device_ids[logical_device_id]);
 
+        } else if (device_token == "WH" || device_token == "BH") {
+            // Arch name token: expand to all device indices matching the target architecture.
+            tt::ARCH target_arch = (device_token == "WH") ? tt::ARCH::WORMHOLE_B0 : tt::ARCH::BLACKHOLE;
+            for (int candidate : all_device_ids) {
+                int fd = open(fmt::format("/dev/tenstorrent/{}", candidate).c_str(), O_RDWR | O_CLOEXEC | O_APPEND);
+                if (fd == -1) {
+                    continue;
+                }
+                try {
+                    PciDeviceInfo candidate_info = read_device_info(fd);
+                    if (candidate_info.get_arch() == target_arch) {
+                        filtered_device_ids.insert(candidate);
+                        log_debug(
+                            LogUMD,
+                            "Added device id {} with arch {} because of token filter {}.",
+                            candidate,
+                            arch_to_str(target_arch),
+                            device_token);
+                    }
+                } catch (...) {
+                }
+                close(fd);
+            }
         } else {
             TT_THROW(
-                "Invalid device identifier in TT_VISIBLE_DEVICES: {}.  Valid device identifiers are either integers or "
-                "part of the BDF string.",
+                "Invalid device identifier in TT_VISIBLE_DEVICES: {}.  Valid device identifiers are either integers, "
+                "part of the BDF string, or an architecture name (WH, BH).",
                 device_token);
         }
     }
@@ -360,7 +383,7 @@ std::vector<int> PCIDevice::sort_ids_based_on_bdf(const std::vector<int> &pci_de
     return sorted_ids_based_on_bdf;
 }
 
-std::map<int, PciDeviceInfo> PCIDevice::enumerate_devices_info() {
+std::map<int, PciDeviceInfo> PCIDevice::enumerate_devices_info(tt::ARCH arch_filter) {
     std::map<int, PciDeviceInfo> infos;
     for (int n : PCIDevice::enumerate_devices()) {
         int fd = open(fmt::format("/dev/tenstorrent/{}", n).c_str(), O_RDWR | O_CLOEXEC | O_APPEND);
@@ -369,7 +392,10 @@ std::map<int, PciDeviceInfo> PCIDevice::enumerate_devices_info() {
         }
 
         try {
-            infos[n] = read_device_info(fd);
+            PciDeviceInfo device_info = read_device_info(fd);
+            if (arch_filter == tt::ARCH::Invalid || device_info.get_arch() == arch_filter) {
+                infos[n] = device_info;
+            }
         } catch (...) {
         }
 
