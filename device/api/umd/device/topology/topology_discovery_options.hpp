@@ -87,5 +87,9 @@ struct TopologyDiscoveryOptions {
      * Defaults to false.
      */
     bool perform_6u_eth_retrain = false;
+
+    // Open devices with O_APPEND (power-aware). Do not set default power state or trigger
+    // aggregation on open; chips stay at current power. Use for scanning/monitoring without powering up.
+    bool power_aware = false;
 };
 }  // namespace tt::umd

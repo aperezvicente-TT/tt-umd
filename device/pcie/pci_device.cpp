@@ -386,10 +386,15 @@ std::optional<int> PCIDevice::get_pci_device_id(int umd_logical_id) {
     return enumerated_ids[umd_logical_id];
 }
 
-PCIDevice::PCIDevice(int pci_device_number) :
+static int open_chardev_fd(const std::string& path, bool power_aware) {
+    int flags = power_aware ? (O_RDWR | O_CLOEXEC | O_APPEND) : (O_RDWR | O_CLOEXEC);
+    return open(path.c_str(), flags);
+}
+
+PCIDevice::PCIDevice(int pci_device_number, bool power_aware) :
     device_path(fmt::format("/dev/tenstorrent/{}", pci_device_number)),
     pci_device_num(pci_device_number),
-    pci_device_file_desc(open(device_path.c_str(), O_RDWR | O_CLOEXEC)),
+    pci_device_file_desc(open_chardev_fd(device_path, power_aware)),
     info(read_device_info(pci_device_file_desc)),
     numa_node(read_sysfs<int>(info, "numa_node", -1)),  // default to -1 if not found
     revision(read_sysfs<int>(info, "revision")),
@@ -411,7 +416,8 @@ PCIDevice::PCIDevice(int pci_device_number) :
             KMD_MAP_TO_NOC.to_string());
     }
 
-    int ret_code = tt_device_open(device_path.c_str(), &tt_device_handle);
+    int ret_code = power_aware ? tt_device_open_power_aware(device_path.c_str(), &tt_device_handle)
+                               : tt_device_open(device_path.c_str(), &tt_device_handle);
 
     if (ret_code != 0) {
         if (tt_device_handle != nullptr) {
@@ -860,6 +866,17 @@ void PCIDevice::configure_tlb(const uint32_t tlb_index, const tlb_data &tlb_conf
 
 void PCIDevice::reset_device_ioctl(const std::unordered_set<int> &pci_target_devices, TenstorrentResetDevice flag) {
     umd::reset_device_ioctl(pci_target_devices, static_cast<uint32_t>(flag));
+}
+
+void PCIDevice::set_power_state_ioctl(DevicePowerState state) {
+    struct tenstorrent_power_state power_state = {};
+    power_state.argsz = sizeof(power_state);
+    power_state.validity = TT_POWER_VALIDITY(1, 0);  /* 1 flag (MAX_AI_CLK), 0 settings */
+    power_state.power_flags = (state == DevicePowerState::BUSY) ? TT_POWER_FLAG_MAX_AI_CLK : 0;
+
+    if (ioctl(pci_device_file_desc, TENSTORRENT_IOCTL_SET_POWER_STATE, &power_state) == -1) {
+        TT_THROW("TENSTORRENT_IOCTL_SET_POWER_STATE failed: {}", strerror(errno));
+    }
 }
 
 uint8_t PCIDevice::read_command_byte(const int pci_device_num) {
