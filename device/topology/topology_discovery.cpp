@@ -46,7 +46,7 @@ std::unique_ptr<TopologyDiscovery> TopologyDiscovery::create_topology_discovery(
 
     switch (io_device_type) {
         case IODeviceType::PCIe: {
-            auto pci_devices_info = PCIDevice::enumerate_devices_info();
+            auto pci_devices_info = PCIDevice::enumerate_devices_info(options.preferred_arch);
             if (pci_devices_info.empty()) {
                 return nullptr;
             }

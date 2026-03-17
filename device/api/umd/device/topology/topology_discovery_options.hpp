@@ -85,5 +85,9 @@ struct TopologyDiscoveryOptions {
     // to opt out of KMD legacy mode (KMD >= 2.6.0), allowing idle power reduction.
     // Default is false (high-power / legacy mode) to preserve backward compatibility.
     bool low_power = false;
+
+    // When set, only PCIe devices matching this architecture are included in topology.
+    // Enables multi-arch hosts to run separate per-arch discover() calls.
+    tt::ARCH preferred_arch = tt::ARCH::Invalid;
 };
 }  // namespace tt::umd

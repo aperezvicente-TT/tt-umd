@@ -135,8 +135,10 @@ public:
 
     /**
      * @return a map of PCI device numbers (/dev/tenstorrent/N) to PciDeviceInfo
+     * When arch_filter is not Invalid, only devices matching that architecture are returned.
+     * Respects TT_VISIBLE_DEVICES in addition to the arch filter.
      */
-    static std::map<int, PciDeviceInfo> enumerate_devices_info();
+    static std::map<int, PciDeviceInfo> enumerate_devices_info(tt::ARCH arch_filter = tt::ARCH::Invalid);
 
     /**
      * Returns the PCI device ID for the given UMD logical ID (index into enumerate_devices()).
