@@ -125,6 +125,9 @@ void TopologyDiscovery::get_connected_devices() {
 
     for (auto& device_id : local_device_ids) {
         std::unique_ptr<TTDevice> tt_device = TTDevice::create(device_id, io_device_type);
+        if (!options.low_power) {
+            tt_device->set_power_state(true);
+        }
         if (tt_device->get_arch() != get_topology_arch()) {
             log_warning(
                 LogUMD,
@@ -196,16 +199,6 @@ void TopologyDiscovery::discover_remote_devices() {
             CoreType::ETH, is_selected_noc1() ? CoordSystem::NOC1 : CoordSystem::NOC0);
         for (const CoreCoord& eth_core : eth_cores) {
             const uint32_t channel = get_soc_descriptor(tt_device).get_eth_channel_for_core(eth_core);
-
-            if (is_eth_port_disabled(tt_device, eth_core)) {
-                log_debug(
-                    LogUMD,
-                    "Skipping disabled ETH core {} on device ASIC ID: {} (port_disable_mask bit {} is set)",
-                    eth_core.str(),
-                    current_device_asic_id,
-                    channel);
-                continue;
-            }
 
             if (!eth_heartbeat_running(tt_device, eth_core)) {
                 std::string msg = fmt::format(
