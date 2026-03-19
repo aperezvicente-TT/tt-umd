@@ -19,6 +19,7 @@
 #include "umd/device/pcie/pci_device.hpp"
 #include "umd/device/pcie/tlb_window.hpp"
 #include "umd/device/types/cluster_descriptor_types.hpp"
+#include "umd/device/types/cluster_types.hpp"
 #include "umd/device/types/communication_protocol.hpp"
 #include "umd/device/utils/lock_manager.hpp"
 #include "umd/device/utils/timeouts.hpp"
@@ -117,6 +118,18 @@ public:
      * @throws std::runtime_error if the DMA transfer fails
      */
     virtual void dma_h2d_zero_copy(uint32_t dst, const void *src, size_t size) = 0;
+
+    /**
+     * True zero-copy H2D DMA via kernel driver. The kernel pins user pages
+     * and programs the DW PCIe DMA engine, bypassing any bounce buffer.
+     * Falls back to dma_h2d() if the kernel ioctl is not available.
+     */
+    virtual void dma_h2d_true_zero_copy(uint32_t dst, const void *src, size_t size);
+
+    /**
+     * True zero-copy D2H DMA via kernel driver. See dma_h2d_true_zero_copy().
+     */
+    virtual void dma_d2h_true_zero_copy(void *dst, uint32_t src, size_t size);
 
     // Read/write functions that always use same TLB entry. This is not supposed to be used
     // on any code path that is performance critical. It is used to read/write the data needed
@@ -236,6 +249,12 @@ public:
     virtual void configure_iatu_region(size_t region, uint64_t target, size_t region_size);
 
     virtual ChipInfo get_chip_info();
+
+    /**
+     * Set power state via KMD SET_POWER_STATE ioctl so the kernel aggregates across all fds.
+     * @return true if the state was set via ioctl (e.g. Blackhole PCIe), false to use direct ARC path.
+     */
+    virtual bool set_power_state_via_kmd(DevicePowerState state) { return false; }
 
     FirmwareBundleVersion get_firmware_version();
 

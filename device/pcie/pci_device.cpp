@@ -27,6 +27,7 @@
 #include <stdexcept>
 #include <string>
 #include <tt-logger/tt-logger.hpp>
+#include <chrono>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -266,12 +267,20 @@ std::vector<int> PCIDevice::enumerate_devices() {
 
     std::vector<std::string> device_tokens = utils::split_string_by_comma(tt_visible_devices_str);
 
+    std::vector<int> all_device_ids = get_all_device_ids();
     std::map<std::string, int> bdf_to_device_id_map = get_bdf_to_device_id_map();
 
-    std::vector<int> all_device_ids = {};
-
-    for (const auto &[bdf, device_id] : get_bdf_to_device_id_map()) {
-        all_device_ids.push_back(device_id);
+    // Build a globally-stable logical ID map: sort all devices by BDF, then assign
+    // 0-based indices.  This map is always computed from the *full* device set so
+    // that logical IDs are stable regardless of what TT_VISIBLE_DEVICES contains.
+    // logical_id_to_kmd[i] == KMD device ID whose BDF-sorted rank is i.
+    std::vector<std::pair<std::string, int>> bdf_sorted_devices(bdf_to_device_id_map.begin(), bdf_to_device_id_map.end());
+    std::sort(bdf_sorted_devices.begin(), bdf_sorted_devices.end(),
+              [](const auto &a, const auto &b) { return a.first < b.first; });
+    std::vector<int> logical_id_to_kmd;
+    logical_id_to_kmd.reserve(bdf_sorted_devices.size());
+    for (const auto &p : bdf_sorted_devices) {
+        logical_id_to_kmd.push_back(p.second);
     }
 
     std::set<int> filtered_device_ids;
@@ -310,23 +319,26 @@ std::vector<int> PCIDevice::enumerate_devices() {
         bool is_integer = !device_token.empty() && std::all_of(device_token.begin(), device_token.end(), ::isdigit);
 
         if (is_integer) {
-            int logical_device_id = std::stoi(device_token);
-
-            if (logical_device_id < 0 || logical_device_id >= all_device_ids.size()) {
+            // Integers are interpreted as stable logical IDs (0-based BDF-sorted rank
+            // over the *full* device set), so that the same integer always selects the
+            // same physical device regardless of which other devices are also visible.
+            int logical_id = std::stoi(device_token);
+            if (logical_id >= 0 && logical_id < static_cast<int>(logical_id_to_kmd.size())) {
+                int kmd_id = logical_id_to_kmd[logical_id];
+                filtered_device_ids.insert(kmd_id);
+                log_debug(
+                    LogUMD,
+                    "Added device kmd_id {} (logical_id={}) because of token filter {}.",
+                    kmd_id,
+                    logical_id,
+                    device_token);
+            } else {
                 TT_THROW(
-                    "Invalid device ID in TT_VISIBLE_DEVICES: {}.  Valid device identifiers are either integers or "
-                    "part of the BDF string. Valid integer IDs are between 0 and {}.",
-                    device_token,
-                    all_device_ids.size() - 1);
+                    "Invalid logical device ID {} in TT_VISIBLE_DEVICES: value must be in [0, {}).  "
+                    "Valid identifiers are BDF-sorted logical IDs (integers) or BDF substrings.",
+                    logical_id,
+                    logical_id_to_kmd.size());
             }
-
-            log_debug(
-                LogUMD,
-                "Added device id {} because of token filter {}.",
-                all_device_ids[logical_device_id],
-                device_token);
-
-            filtered_device_ids.insert(all_device_ids[logical_device_id]);
 
         } else {
             TT_THROW(
@@ -539,9 +551,30 @@ PCIDevice::PCIDevice(int pci_device_number) :
     }
 
     allocate_pcie_dma_buffer();
+
+    // Probe whether KMD supports the DMA transfer IOCTL.
+    tenstorrent_dma_transfer probe{};
+    probe.in.flags = TENSTORRENT_DMA_H2D;
+    probe.in.size = 0;
+    kernel_dma_enabled_ = (ioctl(pci_device_file_desc, TENSTORRENT_IOCTL_DMA_TRANSFER, &probe) != -1);
+    log_debug(LogUMD, "Kernel DMA support: {}", kernel_dma_enabled_ ? "available" : "not available");
+
+    // Probe whether KMD supports the batch DMA IOCTL.
+    tenstorrent_dma_batch batch_probe{};
+    batch_probe.in.flags = TENSTORRENT_DMA_H2D;
+    batch_probe.in.count = 0;
+    kernel_dma_batch_enabled_ = (ioctl(pci_device_file_desc, TENSTORRENT_IOCTL_DMA_BATCH, &batch_probe) != -1);
+    log_debug(LogUMD, "Kernel DMA batch support: {}", kernel_dma_batch_enabled_ ? "available" : "not available");
+
+    if (kernel_dma_batch_enabled_) {
+        static constexpr size_t DMA_STAGING_SIZE = 32 * 1024 * 1024;  // 32 MB
+        allocate_dma_staging_buffer(DMA_STAGING_SIZE);
+    }
 }
 
 PCIDevice::~PCIDevice() {
+    free_dma_staging_buffer();
+
     int ret_code = tt_device_close(tt_device_handle);
 
     if (ret_code != 0) {
@@ -765,6 +798,232 @@ void PCIDevice::unmap_for_dma(void *buffer, size_t size) {
         unpin_pages.in.size);
 }
 
+uint64_t PCIDevice::kernel_dma_transfer(const void *host_addr, uint32_t device_addr,
+                                        size_t size, bool is_h2d) {
+    tenstorrent_dma_transfer dma_xfer{};
+    dma_xfer.in.flags = is_h2d ? TENSTORRENT_DMA_H2D : TENSTORRENT_DMA_D2H;
+    dma_xfer.in.device_addr = device_addr;
+    dma_xfer.in.host_addr = reinterpret_cast<uint64_t>(host_addr);
+    dma_xfer.in.size = size;
+
+    auto t0 = std::chrono::high_resolution_clock::now();
+    int rc = ioctl(pci_device_file_desc, TENSTORRENT_IOCTL_DMA_TRANSFER, &dma_xfer);
+    auto t1 = std::chrono::high_resolution_clock::now();
+
+    if (rc == -1) {
+        TT_THROW(
+            "TENSTORRENT_IOCTL_DMA_TRANSFER failed: {} (host_addr={:#x}, device_addr={:#x}, size={:#x}, h2d={})",
+            strerror(errno),
+            dma_xfer.in.host_addr,
+            dma_xfer.in.device_addr,
+            dma_xfer.in.size,
+            is_h2d);
+    }
+
+    static const bool trace = std::getenv("TT_DMA_TRACE") != nullptr;
+    if (trace) {
+        auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+        log_info(LogUMD,
+            "kernel_dma_transfer: dev_addr={:#x} size={:#x} h2d={} => {}us",
+            device_addr, size, is_h2d, us);
+    }
+
+    return dma_xfer.out.bytes_transferred;
+}
+
+uint32_t PCIDevice::dma_pin_buffer(const void *addr, size_t size) {
+    tenstorrent_dma_pin_buffer pin{};
+    pin.in.host_addr = reinterpret_cast<uint64_t>(addr);
+    pin.in.size = size;
+    pin.in.flags = 0;
+
+    if (ioctl(pci_device_file_desc, TENSTORRENT_IOCTL_DMA_PIN_BUFFER, &pin) == -1) {
+        TT_THROW("TENSTORRENT_IOCTL_DMA_PIN_BUFFER failed: {} (addr={:#x}, size={:#x})",
+                 strerror(errno),
+                 pin.in.host_addr,
+                 pin.in.size);
+    }
+
+    return pin.out.handle;
+}
+
+void PCIDevice::dma_unpin_buffer(uint32_t handle) {
+    tenstorrent_dma_unpin_buffer unpin{};
+    unpin.in.handle = handle;
+
+    if (ioctl(pci_device_file_desc, TENSTORRENT_IOCTL_DMA_UNPIN_BUFFER, &unpin) == -1) {
+        log_warning(LogUMD, "TENSTORRENT_IOCTL_DMA_UNPIN_BUFFER failed: {} (handle={})",
+                    strerror(errno), handle);
+    }
+}
+
+uint64_t PCIDevice::kernel_dma_transfer_pinned(uint32_t handle, uint64_t offset,
+                                                uint32_t device_addr, size_t size,
+                                                bool is_h2d) {
+    tenstorrent_dma_transfer dma_xfer{};
+    dma_xfer.in.flags = (is_h2d ? TENSTORRENT_DMA_H2D : TENSTORRENT_DMA_D2H)
+                        | TENSTORRENT_DMA_FLAG_PINNED;
+    dma_xfer.in.device_addr = device_addr;
+    dma_xfer.in.host_addr = (static_cast<uint64_t>(handle) << 32) | (offset & 0xFFFFFFFF);
+    dma_xfer.in.size = size;
+
+    auto t0 = std::chrono::high_resolution_clock::now();
+    int rc = ioctl(pci_device_file_desc, TENSTORRENT_IOCTL_DMA_TRANSFER, &dma_xfer);
+    auto t1 = std::chrono::high_resolution_clock::now();
+
+    if (rc == -1) {
+        TT_THROW("TENSTORRENT_IOCTL_DMA_TRANSFER (pinned) failed: {} (handle={}, offset={:#x}, "
+                 "device_addr={:#x}, size={:#x}, h2d={})",
+                 strerror(errno), handle, offset, device_addr, size, is_h2d);
+    }
+
+    static const bool trace = std::getenv("TT_DMA_TRACE") != nullptr;
+    if (trace) {
+        auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+        log_info(LogUMD,
+            "kernel_dma_transfer_pinned: handle={} off={:#x} dev_addr={:#x} size={:#x} h2d={} => {}us",
+            handle, offset, device_addr, size, is_h2d, us);
+    }
+
+    return dma_xfer.out.bytes_transferred;
+}
+
+uint64_t PCIDevice::kernel_dma_batch_transfer(const void *host_base, size_t host_size,
+                                              const DmaBatchEntry *entries, uint32_t count,
+                                              bool is_h2d) {
+    static_assert(sizeof(DmaBatchEntry) == sizeof(tenstorrent_dma_batch_entry),
+                  "DmaBatchEntry must match kernel struct layout");
+
+    tenstorrent_dma_batch batch{};
+    batch.in.flags = is_h2d ? TENSTORRENT_DMA_H2D : TENSTORRENT_DMA_D2H;
+    batch.in.count = count;
+    batch.in.host_base_addr = reinterpret_cast<uint64_t>(host_base);
+    batch.in.host_base_size = host_size;
+    batch.in.entries_ptr = reinterpret_cast<uint64_t>(entries);
+
+    if (ioctl(pci_device_file_desc, TENSTORRENT_IOCTL_DMA_BATCH, &batch) == -1) {
+        TT_THROW(
+            "TENSTORRENT_IOCTL_DMA_BATCH failed: {} (count={}, host_base={:#x}, host_size={:#x}, h2d={}, "
+            "completed={}/{})",
+            strerror(errno),
+            count,
+            batch.in.host_base_addr,
+            batch.in.host_base_size,
+            is_h2d,
+            batch.out.completed_count,
+            count);
+    }
+
+    return batch.out.bytes_transferred;
+}
+
+uint64_t PCIDevice::kernel_dma_batch_transfer_pinned(uint32_t pin_handle, size_t host_size,
+                                                     const DmaBatchEntry *entries, uint32_t count,
+                                                     bool is_h2d) {
+    static_assert(sizeof(DmaBatchEntry) == sizeof(tenstorrent_dma_batch_entry),
+                  "DmaBatchEntry must match kernel struct layout");
+
+    tenstorrent_dma_batch batch{};
+    batch.in.flags = (is_h2d ? TENSTORRENT_DMA_H2D : TENSTORRENT_DMA_D2H)
+                     | TENSTORRENT_DMA_FLAG_PINNED;
+    batch.in.count = count;
+    batch.in.host_base_addr = static_cast<uint64_t>(pin_handle) << 32;
+    batch.in.host_base_size = host_size;
+    batch.in.entries_ptr = reinterpret_cast<uint64_t>(entries);
+
+    if (ioctl(pci_device_file_desc, TENSTORRENT_IOCTL_DMA_BATCH, &batch) == -1) {
+        int saved_errno = errno;
+        TT_THROW(
+            "TENSTORRENT_IOCTL_DMA_BATCH (pinned) failed: {} (count={}, handle={}, host_size={}, h2d={}, "
+            "completed={}/{})",
+            strerror(saved_errno),
+            count,
+            pin_handle,
+            host_size,
+            is_h2d,
+            batch.out.completed_count,
+            count);
+    }
+
+    return batch.out.bytes_transferred;
+}
+
+bool PCIDevice::allocate_dma_staging_buffer(size_t size) {
+    if (dma_staging_buf_.host_ptr) {
+        return true;
+    }
+
+    #ifndef MAP_HUGE_SHIFT
+    #define MAP_HUGE_SHIFT 26
+    #endif
+    #ifndef MAP_HUGE_1GB
+    #define MAP_HUGE_1GB (30 << MAP_HUGE_SHIFT)
+    #endif
+    #ifndef MAP_HUGE_2MB
+    #define MAP_HUGE_2MB (21 << MAP_HUGE_SHIFT)
+    #endif
+
+    void *mapping = MAP_FAILED;
+    size_t alloc_size = 0;
+    const char *page_type = "4KB pages";
+
+    static constexpr size_t SIZE_1GB = 1UL << 30;
+    static constexpr size_t SIZE_2MB = 1UL << 21;
+
+    alloc_size = (size + SIZE_1GB - 1) & ~(SIZE_1GB - 1);
+    mapping = mmap(nullptr, alloc_size, PROT_READ | PROT_WRITE,
+                   MAP_ANONYMOUS | MAP_PRIVATE | MAP_POPULATE | MAP_HUGETLB | MAP_HUGE_1GB, -1, 0);
+    if (mapping != MAP_FAILED) {
+        page_type = "1GB hugepages";
+    }
+
+    if (mapping == MAP_FAILED) {
+        alloc_size = (size + SIZE_2MB - 1) & ~(SIZE_2MB - 1);
+        mapping = mmap(nullptr, alloc_size, PROT_READ | PROT_WRITE,
+                       MAP_ANONYMOUS | MAP_PRIVATE | MAP_POPULATE | MAP_HUGETLB | MAP_HUGE_2MB, -1, 0);
+        if (mapping != MAP_FAILED) {
+            page_type = "2MB hugepages";
+        }
+    }
+
+    if (mapping == MAP_FAILED) {
+        alloc_size = size;
+        mapping = mmap(nullptr, alloc_size, PROT_READ | PROT_WRITE,
+                       MAP_ANONYMOUS | MAP_PRIVATE | MAP_POPULATE, -1, 0);
+    }
+
+    if (mapping == MAP_FAILED) {
+        log_warning(LogUMD, "Failed to mmap DMA staging buffer (size={:#x}): {}", size, strerror(errno));
+        return false;
+    }
+
+    try {
+        uint32_t handle = dma_pin_buffer(mapping, alloc_size);
+        dma_staging_buf_.host_ptr = mapping;
+        dma_staging_buf_.size = alloc_size;
+        dma_staging_buf_.pin_handle = handle;
+        log_info(LogUMD, "DMA staging buffer ready: {:#x} bytes, pin_handle={} ({})",
+                 alloc_size, handle, page_type);
+        return true;
+    } catch (const std::exception &e) {
+        log_warning(LogUMD, "Failed to pin DMA staging buffer: {}", e.what());
+        munmap(mapping, alloc_size);
+        return false;
+    }
+}
+
+const PCIDevice::DmaStagingBuffer* PCIDevice::get_dma_staging_buffer() const {
+    return dma_staging_buf_.host_ptr ? &dma_staging_buf_ : nullptr;
+}
+
+void PCIDevice::free_dma_staging_buffer() {
+    if (dma_staging_buf_.host_ptr) {
+        dma_unpin_buffer(dma_staging_buf_.pin_handle);
+        munmap(dma_staging_buf_.host_ptr, dma_staging_buf_.size);
+        dma_staging_buf_ = {};
+    }
+}
+
 SemVer PCIDevice::read_kmd_version() {
     static const std::string path = "/sys/module/tenstorrent/version";
     std::ifstream file(path);
@@ -836,6 +1095,17 @@ void PCIDevice::configure_tlb(const uint32_t tlb_index, const tlb_data &tlb_conf
 
 void PCIDevice::reset_device_ioctl(const std::unordered_set<int> &pci_target_devices, TenstorrentResetDevice flag) {
     umd::reset_device_ioctl(pci_target_devices, static_cast<uint32_t>(flag));
+}
+
+void PCIDevice::set_power_state_ioctl(DevicePowerState state) {
+    struct tenstorrent_power_state power_state = {};
+    power_state.argsz = sizeof(power_state);
+    power_state.validity = TT_POWER_VALIDITY(1, 0);  /* 1 flag (MAX_AI_CLK), 0 settings */
+    power_state.power_flags = (state == DevicePowerState::BUSY) ? TT_POWER_FLAG_MAX_AI_CLK : 0;
+
+    if (ioctl(pci_device_file_desc, TENSTORRENT_IOCTL_SET_POWER_STATE, &power_state) == -1) {
+        TT_THROW("TENSTORRENT_IOCTL_SET_POWER_STATE failed: {}", strerror(errno));
+    }
 }
 
 uint8_t PCIDevice::read_command_byte(const int pci_device_num) {

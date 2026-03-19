@@ -336,6 +336,24 @@ void WormholeTTDevice::dma_d2h_zero_copy(void *dst, uint32_t src, size_t size) {
     dma_d2h_transfer(reinterpret_cast<uint64_t>(dst), src, size);
 }
 
+void WormholeTTDevice::dma_h2d_true_zero_copy(uint32_t dst, const void *src, size_t size) {
+    auto pci_device = get_pci_device();
+    if (pci_device && pci_device->has_kernel_dma()) {
+        pci_device->kernel_dma_transfer(src, dst, size, true);
+    } else {
+        dma_h2d(dst, src, size);
+    }
+}
+
+void WormholeTTDevice::dma_d2h_true_zero_copy(void *dst, uint32_t src, size_t size) {
+    auto pci_device = get_pci_device();
+    if (pci_device && pci_device->has_kernel_dma()) {
+        pci_device->kernel_dma_transfer(dst, src, size, false);
+    } else {
+        dma_d2h(dst, src, size);
+    }
+}
+
 void WormholeTTDevice::read_from_arc_apb(void *mem_ptr, uint64_t arc_addr_offset, size_t size) {
     if (arc_addr_offset > wormhole::ARC_APB_ADDRESS_RANGE) {
         throw std::runtime_error("Address is out of ARC APB address range");

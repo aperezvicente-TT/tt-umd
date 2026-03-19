@@ -340,6 +340,15 @@ int BlackholeTTDevice::get_pcie_x_coordinate() {
 // x = 2: ARC not accessible, x = 11: ARC accessible
 bool BlackholeTTDevice::is_arc_available_over_axi() { return (get_pcie_x_coordinate() == 11); }
 
+bool BlackholeTTDevice::set_power_state_via_kmd(DevicePowerState state) {
+    std::shared_ptr<PCIDevice> pci = get_pci_device();
+    if (!pci) {
+        return false;  /* JTAG-created device: no chardev fd, use direct ARC path */
+    }
+    pci->set_power_state_ioctl(state);
+    return true;
+}
+
 void BlackholeTTDevice::dma_multicast_write(
     void *src, size_t size, tt_xy_pair core_start, tt_xy_pair core_end, uint64_t addr) {
     throw std::runtime_error("DMA multicast write not supported for Blackhole devices.");

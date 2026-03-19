@@ -18,6 +18,7 @@
 #include "umd/device/pcie/tlb_handle.hpp"
 #include "umd/device/tt_kmd_lib/tt_kmd_lib.h"
 #include "umd/device/types/arch.hpp"
+#include "umd/device/types/cluster_types.hpp"
 #include "umd/device/types/tlb.hpp"
 #include "umd/device/types/xy_pair.hpp"
 #include "umd/device/utils/semver.hpp"
@@ -113,6 +114,14 @@ enum class TenstorrentResetDevice : uint32_t {
 };
 
 class PCIDevice {
+public:
+    struct DmaStagingBuffer {
+        void* host_ptr = nullptr;
+        size_t size = 0;
+        uint32_t pin_handle = 0;
+    };
+
+private:
     const std::string device_path;   // Path to character device: /dev/tenstorrent/N
     const int pci_device_num;        // N in /dev/tenstorrent/N
     const int pci_device_file_desc;  // Character device file descriptor
@@ -122,8 +131,11 @@ class PCIDevice {
     const tt::ARCH arch;             // e.g. Wormhole, Blackhole
     const SemVer kmd_version;        // KMD version
     const bool iommu_enabled;        // Whether the system is protected from this device by an IOMMU
+    bool kernel_dma_enabled_ = false;       // Whether KMD supports the DMA transfer IOCTL
+    bool kernel_dma_batch_enabled_ = false; // Whether KMD supports the batch DMA IOCTL
     std::unique_ptr<architecture_implementation> arch_impl_;  // Architecture-specific implementation
     DmaBuffer dma_buffer{};
+    DmaStagingBuffer dma_staging_buf_{};
 
 public:
     /**
@@ -203,6 +215,91 @@ public:
      * @return whether the system is protected from this device by an IOMMU
      */
     bool is_iommu_enabled() const { return iommu_enabled; }
+
+    /**
+     * @return whether the kernel driver supports DMA transfer IOCTLs
+     */
+    bool has_kernel_dma() const { return kernel_dma_enabled_; }
+
+    /**
+     * Perform a true zero-copy DMA transfer via the kernel driver.
+     * @param host_addr User virtual address of the host buffer
+     * @param device_addr Device-side BAR0 address (32-bit)
+     * @param size Transfer size in bytes (must be 4-byte aligned)
+     * @param is_h2d true for Host-to-Device, false for Device-to-Host
+     * @return bytes transferred
+     * @throws std::runtime_error on failure
+     */
+    uint64_t kernel_dma_transfer(const void *host_addr, uint32_t device_addr,
+                                 size_t size, bool is_h2d);
+
+    struct DmaBatchEntry {
+        uint32_t device_addr;
+        uint32_t size;
+        uint64_t host_offset;
+    };
+
+    /**
+     * Perform a scatter-gather batch DMA transfer via the kernel driver.
+     * Pins host_base once and dispatches all entries across parallel HW DMA channels.
+     * @param host_base     Base VA of the host buffer
+     * @param host_size     Total size of the host buffer
+     * @param entries       Array of (device_addr, size, host_offset) entries
+     * @param count         Number of entries
+     * @param is_h2d        true for Host-to-Device, false for Device-to-Host
+     * @return total bytes transferred
+     * @throws std::runtime_error on failure
+     */
+    uint64_t kernel_dma_batch_transfer(const void *host_base, size_t host_size,
+                                       const DmaBatchEntry *entries, uint32_t count,
+                                       bool is_h2d);
+
+    /**
+     * Batch DMA transfer using a pre-pinned buffer handle (no per-call pin/unpin).
+     * @param pin_handle  Handle from dma_pin_buffer()
+     * @param host_size   Total size of the pinned buffer
+     * @param entries     Array of (device_addr, size, host_offset) entries
+     * @param count       Number of entries
+     * @param is_h2d      true for Host-to-Device, false for Device-to-Host
+     * @return total bytes transferred
+     */
+    uint64_t kernel_dma_batch_transfer_pinned(uint32_t pin_handle, size_t host_size,
+                                              const DmaBatchEntry *entries, uint32_t count,
+                                              bool is_h2d);
+
+    bool allocate_dma_staging_buffer(size_t size);
+    const DmaStagingBuffer* get_dma_staging_buffer() const;
+    void free_dma_staging_buffer();
+
+    /**
+     * @return whether the kernel driver supports the batch DMA IOCTL
+     */
+    bool has_kernel_dma_batch() const { return kernel_dma_batch_enabled_; }
+
+    /**
+     * Pin a host buffer for repeated DMA transfers. Avoids per-transfer
+     * pin_user_pages_fast overhead.
+     * @return opaque handle for use with kernel_dma_transfer_pinned()
+     */
+    uint32_t dma_pin_buffer(const void *addr, size_t size);
+
+    /**
+     * Unpin a previously pinned host buffer.
+     */
+    void dma_unpin_buffer(uint32_t handle);
+
+    /**
+     * DMA transfer using a pre-pinned buffer handle (no pin/unpin overhead).
+     * @param handle  Pin handle from dma_pin_buffer()
+     * @param offset  Byte offset within the pinned buffer
+     * @param device_addr  Device-side BAR0 address
+     * @param size  Transfer size in bytes
+     * @param is_h2d  true for Host-to-Device, false for Device-to-Host
+     * @return bytes transferred
+     */
+    uint64_t kernel_dma_transfer_pinned(uint32_t handle, uint64_t offset,
+                                        uint32_t device_addr, size_t size,
+                                        bool is_h2d);
 
     /**
      * Map a buffer for hugepage access.
@@ -286,6 +383,12 @@ public:
      * Reset device via ioctl.
      */
     static void reset_device_ioctl(const std::unordered_set<int> &pci_target_devices, TenstorrentResetDevice flag);
+
+    /**
+     * Set device power state via KMD SET_POWER_STATE ioctl.
+     * Used by Blackhole so the kernel aggregates power state across all open fds.
+     */
+    void set_power_state_ioctl(DevicePowerState state);
 
     /**
      * Temporary function which allows us to support both ways of mapping buffers during the transition period.

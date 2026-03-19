@@ -272,6 +272,8 @@ void LocalChip::read_from_sysmem(uint16_t channel, void* dest, uint64_t sysmem_s
     sysmem_manager_->read_from_sysmem(channel, dest, sysmem_src, size);
 }
 
+static constexpr uint32_t DMA_TRANSFER_THRESHOLD = 4096;
+
 void LocalChip::write_to_device(CoreCoord core, const void* src, uint64_t l1_dest, uint32_t size) {
     log_trace(
         LogUMD,
@@ -287,6 +289,16 @@ void LocalChip::write_to_device(CoreCoord core, const void* src, uint64_t l1_des
     if (tt_device_->get_communication_device_type() != IODeviceType::PCIe) {
         tt_device_->write_to_device(src, translated_core, l1_dest, size);
         return;
+    }
+
+    if (size >= DMA_TRANSFER_THRESHOLD && tt_device_->get_pci_device() &&
+        tt_device_->get_pci_device()->has_kernel_dma()) {
+        try {
+            tt_device_->dma_write_to_device(src, size, translated_core, l1_dest);
+            return;
+        } catch (const std::exception& e) {
+            log_warning(LogUMD, "Kernel DMA write failed ({}), falling back to MMIO", e.what());
+        }
     }
 
     if (tlb_manager_->is_tlb_mapped(translated_core, l1_dest, size)) {
@@ -314,6 +326,17 @@ void LocalChip::read_from_device(CoreCoord core, void* dest, uint64_t l1_src, ui
         tt_device_->read_from_device(dest, translated_core, l1_src, size);
         return;
     }
+
+    if (size >= DMA_TRANSFER_THRESHOLD && tt_device_->get_pci_device() &&
+        tt_device_->get_pci_device()->has_kernel_dma()) {
+        try {
+            tt_device_->dma_read_from_device(dest, size, translated_core, l1_src);
+            return;
+        } catch (const std::exception& e) {
+            log_warning(LogUMD, "Kernel DMA read failed ({}), falling back to MMIO", e.what());
+        }
+    }
+
     if (tlb_manager_->is_tlb_mapped(translated_core, l1_src, size)) {
         TlbWindow* tlb_window = tlb_manager_->get_tlb_window(translated_core);
         tlb_window->read_block(l1_src - tlb_window->get_base_address(), dest, size);

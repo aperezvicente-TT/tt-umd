@@ -362,13 +362,23 @@ void TTDevice::noc_multicast_write(void *dst, size_t size, tt_xy_pair core_start
     get_cached_tlb_window()->noc_multicast_write_reconfigure(dst, size, core_start, core_end, addr, tlb_data::Strict);
 }
 
+void TTDevice::dma_h2d_true_zero_copy(uint32_t dst, const void *src, size_t size) {
+    dma_h2d(dst, src, size);
+}
+
+void TTDevice::dma_d2h_true_zero_copy(void *dst, uint32_t src, size_t size) {
+    dma_d2h(dst, src, size);
+}
+
 void TTDevice::dma_write_to_device(const void *src, size_t size, tt_xy_pair core, uint64_t addr) {
     if (get_communication_device_type() != IODeviceType::PCIe) {
         TT_THROW(
             "DMA operations are not supported for {} devices.", DeviceTypeToString.at(get_communication_device_type()));
     }
 
-    if (get_pci_device()->get_dma_buffer().buffer == nullptr) {
+    bool use_kernel_dma = get_pci_device()->has_kernel_dma();
+
+    if (!use_kernel_dma && get_pci_device()->get_dma_buffer().buffer == nullptr) {
         log_warning(
             LogUMD,
             "DMA buffer was not allocated for PCI device {}, falling back to non-DMA (regular MMIO TLB) write.",
@@ -382,7 +392,7 @@ void TTDevice::dma_write_to_device(const void *src, size_t size, tt_xy_pair core
 
     const uint8_t *buffer = static_cast<const uint8_t *>(src);
     PCIDevice *pci_device = get_pci_device().get();
-    size_t dmabuf_size = pci_device->get_dma_buffer().size;
+    size_t max_chunk = use_kernel_dma ? SIZE_MAX : pci_device->get_dma_buffer().size;
 
     tlb_data config{};
     config.local_offset = addr;
@@ -401,9 +411,13 @@ void TTDevice::dma_write_to_device(const void *src, size_t size, tt_xy_pair core
     while (size > 0) {
         auto tlb_size = tlb_window->get_size();
 
-        size_t transfer_size = std::min({size, tlb_size, dmabuf_size});
+        size_t transfer_size = std::min({size, tlb_size, max_chunk});
 
-        dma_h2d(axi_address, buffer, transfer_size);
+        if (use_kernel_dma) {
+            dma_h2d_true_zero_copy(axi_address, buffer, transfer_size);
+        } else {
+            dma_h2d(axi_address, buffer, transfer_size);
+        }
 
         size -= transfer_size;
         addr += transfer_size;
@@ -421,7 +435,9 @@ void TTDevice::dma_read_from_device(void *dst, size_t size, tt_xy_pair core, uin
             "DMA operations are not supported for {} devices.", DeviceTypeToString.at(get_communication_device_type()));
     }
 
-    if (get_pci_device()->get_dma_buffer().buffer == nullptr) {
+    bool use_kernel_dma = get_pci_device()->has_kernel_dma();
+
+    if (!use_kernel_dma && get_pci_device()->get_dma_buffer().buffer == nullptr) {
         log_warning(
             LogUMD,
             "DMA buffer was not allocated for PCI device {}, falling back to non-DMA (regular MMIO TLB) read.",
@@ -435,7 +451,7 @@ void TTDevice::dma_read_from_device(void *dst, size_t size, tt_xy_pair core, uin
 
     uint8_t *buffer = static_cast<uint8_t *>(dst);
     PCIDevice *pci_device = get_pci_device().get();
-    size_t dmabuf_size = pci_device->get_dma_buffer().size;
+    size_t max_chunk = use_kernel_dma ? SIZE_MAX : pci_device->get_dma_buffer().size;
 
     tlb_data config{};
     config.local_offset = addr;
@@ -454,9 +470,13 @@ void TTDevice::dma_read_from_device(void *dst, size_t size, tt_xy_pair core, uin
 
     while (size > 0) {
         auto tlb_size = tlb_window->get_size();
-        size_t transfer_size = std::min({size, tlb_size, dmabuf_size});
+        size_t transfer_size = std::min({size, tlb_size, max_chunk});
 
-        dma_d2h(buffer, axi_address, transfer_size);
+        if (use_kernel_dma) {
+            dma_d2h_true_zero_copy(buffer, axi_address, transfer_size);
+        } else {
+            dma_d2h(buffer, axi_address, transfer_size);
+        }
 
         size -= transfer_size;
         addr += transfer_size;

@@ -55,6 +55,8 @@ public:
     void dma_multicast_write(
         void *src, size_t size, tt_xy_pair core_start, tt_xy_pair core_end, uint64_t addr) override;
 
+    bool set_power_state_via_kmd(DevicePowerState state) override;
+
 protected:
     BlackholeTTDevice(std::shared_ptr<PCIDevice> pci_device, bool use_safe_api);
     BlackholeTTDevice(std::shared_ptr<JtagDevice> jtag_device, uint8_t jlink_id);

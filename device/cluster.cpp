@@ -533,6 +533,15 @@ TTDevice* Cluster::get_tt_device(ChipId device_id) const {
     return tt_device;
 }
 
+PCIDevice* Cluster::get_pci_device(int device_id) const {
+    auto* tt_device = get_chip(device_id)->get_tt_device();
+    if (!tt_device) {
+        return nullptr;
+    }
+    auto pci_dev = tt_device->get_pci_device();
+    return pci_dev ? pci_dev.get() : nullptr;
+}
+
 TLBManager* Cluster::get_tlb_manager(ChipId device_id) const { return get_chip(device_id)->get_tlb_manager(); }
 
 Chip* Cluster::get_chip(ChipId device_id) const {

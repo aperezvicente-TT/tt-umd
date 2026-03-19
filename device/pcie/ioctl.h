@@ -30,6 +30,11 @@
 #define TENSTORRENT_IOCTL_FREE_TLB		_IO(TENSTORRENT_IOCTL_MAGIC, 12)
 #define TENSTORRENT_IOCTL_CONFIGURE_TLB		_IO(TENSTORRENT_IOCTL_MAGIC, 13)
 #define TENSTORRENT_IOCTL_SET_NOC_CLEANUP		_IO(TENSTORRENT_IOCTL_MAGIC, 14)
+#define TENSTORRENT_IOCTL_SET_POWER_STATE		_IO(TENSTORRENT_IOCTL_MAGIC, 15)
+#define TENSTORRENT_IOCTL_DMA_TRANSFER			_IO(TENSTORRENT_IOCTL_MAGIC, 16)
+#define TENSTORRENT_IOCTL_DMA_PIN_BUFFER		_IO(TENSTORRENT_IOCTL_MAGIC, 17)
+#define TENSTORRENT_IOCTL_DMA_UNPIN_BUFFER		_IO(TENSTORRENT_IOCTL_MAGIC, 18)
+#define TENSTORRENT_IOCTL_DMA_BATCH			_IO(TENSTORRENT_IOCTL_MAGIC, 19)
 
 // For tenstorrent_mapping.mapping_id. These are not array indices.
 #define TENSTORRENT_MAPPING_UNUSED		0
@@ -333,6 +338,109 @@ struct tenstorrent_set_noc_cleanup {
 	__u32 reserved0;
 	__u64 addr;
 	__u64 data;
+};
+
+/**
+ * TENSTORRENT_IOCTL_SET_POWER_STATE - Set the power state of the device
+ *
+ * The driver tracks the requested power state for each open file descriptor and
+ * sends aggregated updates to the firmware as needed.
+ *
+ * @argsz: Must be sizeof(struct tenstorrent_power_state).
+ * @validity: Bits 0-3 = number of valid flags (0-15), bits 4-7 = valid settings (0-14).
+ * @power_flags: Bitmask for on/off power features. Use TT_POWER_FLAG_* defines.
+ */
+struct tenstorrent_power_state {
+	__u32 argsz;
+	__u32 flags;
+	__u8 reserved0;
+	__u8 validity;
+#define TT_POWER_VALIDITY_FLAGS(n)      (((n) & 0xF) << 0)
+#define TT_POWER_VALIDITY_SETTINGS(n)   (((n) & 0xF) << 4)
+#define TT_POWER_VALIDITY(flags_count, settings_count) \
+	(TT_POWER_VALIDITY_FLAGS(flags_count) | TT_POWER_VALIDITY_SETTINGS(settings_count))
+	__u16 power_flags;
+#define TT_POWER_FLAG_MAX_AI_CLK        (1U << 0) /* 1=Max AI Clock,  0=Min AI Clock */
+#define TT_POWER_FLAG_MRISC_PHY_WAKEUP  (1U << 1)
+#define TT_POWER_FLAG_TENSIX_ENABLE     (1U << 2)
+#define TT_POWER_FLAG_L2CPU_ENABLE      (1U << 3)
+	__u16 power_settings[14];
+};
+
+/* tenstorrent_dma_transfer_in.flags */
+#define TENSTORRENT_DMA_H2D		0	/* Host-to-Device */
+#define TENSTORRENT_DMA_D2H		1	/* Device-to-Host */
+#define TENSTORRENT_DMA_FLAG_PINNED	(1U << 1)	/* host_addr is handle+offset */
+
+struct tenstorrent_dma_transfer_in {
+	__u32 flags;		/* TENSTORRENT_DMA_H2D or TENSTORRENT_DMA_D2H */
+	__u32 device_addr;	/* Device-side NOC PCIe address (32-bit) */
+	__u64 host_addr;	/* User virtual address of host buffer */
+	__u64 size;		/* Transfer size in bytes (must be 4-byte aligned) */
+};
+
+struct tenstorrent_dma_transfer_out {
+	__u64 bytes_transferred;
+	__u64 reserved;
+};
+
+struct tenstorrent_dma_transfer {
+	struct tenstorrent_dma_transfer_in in;
+	struct tenstorrent_dma_transfer_out out;
+};
+
+struct tenstorrent_dma_pin_buffer_in {
+	__u64 host_addr;	/* User VA, must be page-aligned */
+	__u64 size;		/* Buffer size in bytes */
+	__u32 flags;		/* Reserved, must be 0 */
+	__u32 reserved;
+};
+
+struct tenstorrent_dma_pin_buffer_out {
+	__u32 handle;		/* Opaque handle for use with FLAG_PINNED */
+	__u32 reserved;
+};
+
+struct tenstorrent_dma_pin_buffer {
+	struct tenstorrent_dma_pin_buffer_in in;
+	struct tenstorrent_dma_pin_buffer_out out;
+};
+
+struct tenstorrent_dma_unpin_buffer_in {
+	__u32 handle;
+	__u32 reserved;
+};
+
+struct tenstorrent_dma_unpin_buffer {
+	struct tenstorrent_dma_unpin_buffer_in in;
+};
+
+/* Scatter-gather batch DMA: one syscall for N transfers across parallel HW channels */
+#define TENSTORRENT_DMA_BATCH_MAX_ENTRIES	256
+
+struct tenstorrent_dma_batch_entry {
+	__u32 device_addr;	/* Device-side NOC PCIe address (32-bit) */
+	__u32 size;		/* Transfer size in bytes */
+	__u64 host_offset;	/* Byte offset from host_base_addr */
+};
+
+struct tenstorrent_dma_batch_in {
+	__u32 flags;		/* TENSTORRENT_DMA_H2D/D2H */
+	__u32 count;		/* Number of entries [1..BATCH_MAX_ENTRIES] */
+	__u64 host_base_addr;	/* User VA of host buffer base */
+	__u64 host_base_size;	/* Total host buffer size (for pinning) */
+	__u64 entries_ptr;	/* User-space pointer to entries array */
+};
+
+struct tenstorrent_dma_batch_out {
+	__u64 bytes_transferred;
+	__u32 completed_count;
+	__u32 first_error_idx;
+};
+
+struct tenstorrent_dma_batch {
+	struct tenstorrent_dma_batch_in in;
+	struct tenstorrent_dma_batch_out out;
 };
 
 #endif
