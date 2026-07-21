@@ -7,6 +7,7 @@
 #include <fmt/format.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -155,9 +156,19 @@ void LocalChip::start_device(uint32_t dram_membar_subchannel) {
 
 void LocalChip::close_device() {
     ZoneScopedC(tracy::Color::DarkRed);
+    // TT_UMD_PRESERVE_ETH_FW=1 keeps externally-driven eth firmware (e.g.
+    // erisc_cmac_simple loaded by tt-metal for external CMAC ports) alive
+    // across process exits. The LONG_IDLE clock transition slows AICLK
+    // chip-wide, which stops the CMAC PCS marker stream and bounces any
+    // peer link; skipping it (and the ALL-tensix reset that follows) keeps
+    // the eth core running so the next process can warm-reload via the
+    // sentinel-fingerprint check in tt-metal's RiscFirmwareInitializer.
+    const char* preserve_env = std::getenv("TT_UMD_PRESERVE_ETH_FW");
+    const bool preserve_eth_fw = (preserve_env != nullptr && preserve_env[0] != '0' && preserve_env[0] != '\0');
+
     // Investigating https://github.com/tenstorrent/tt-metal/issues/25377 found that closing device that was already put
     // in LONG_IDLE by tt-smi reset would hang
-    if ((uint32_t)get_clock() != get_tt_device()->get_min_clock_freq()) {
+    if (!preserve_eth_fw && (uint32_t)get_clock() != get_tt_device()->get_min_clock_freq()) {
         set_clock_state(DevicePowerState::LONG_IDLE);
         assert_risc_reset(RiscType::ALL);
         // Unmapping might be needed even in the case chip was reset due to kmd mappings.

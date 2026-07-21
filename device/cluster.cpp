@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <initializer_list>
 #include <map>
@@ -1062,11 +1063,23 @@ void Cluster::set_clock_state(DevicePowerState device_state) {
 
 void Cluster::deassert_resets_and_set_clock_state() {
     ZoneScopedC(tracy::Color::DarkGreen);
+    // TT_UMD_PRESERVE_ETH_FW=1 keeps any externally-driven eth firmware
+    // (loaded for external CMAC ports) alive across cluster open. The
+    // tensix-only broadcast already excludes eth rows, but
+    // chip->deassert_risc_resets() sends an ARC message that pulses
+    // RISCV reset chip-wide — including eth cores — which wedges
+    // running CMAC firmware. Skipping it preserves the firmware state
+    // so the next tt-metal init can warm-reload via the sentinel check.
+    const char* preserve_env = std::getenv("TT_UMD_PRESERVE_ETH_FW");
+    const bool preserve_eth_fw = (preserve_env != nullptr && preserve_env[0] != '0' && preserve_env[0] != '\0');
+
     // Assert tensix resets on all chips in cluster.
     assert_risc_reset();
 
-    for (auto& [_, chip] : chips_) {
-        chip->deassert_risc_resets();
+    if (!preserve_eth_fw) {
+        for (auto& [_, chip] : chips_) {
+            chip->deassert_risc_resets();
+        }
     }
 
     // MT Initial BH - ARC messages not supported in Blackhole.
